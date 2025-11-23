@@ -1,0 +1,262 @@
+# ----------------------------
+# 1. Load Libraries
+# ----------------------------
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(haven, dplyr, stringr, readr, labelled, purrr, fs, lubridate)
+
+# ----------------------------
+# 2. Configuration
+# ----------------------------
+wave <- "w9"
+processing_date <- Sys.Date()
+data_dir <- "share_wave_9"
+output_dir <- "output_wave_9"
+features_dir <- file.path(output_dir, "features_by_topic")
+
+dir_create(output_dir)
+dir_create(features_dir)
+
+# ----------------------------
+# 3. Identify All .sav Files
+# ----------------------------
+all_sav_files <- dir_ls(data_dir, regexp = "\\.sav$")
+
+# ----------------------------
+# 4. Define Topic Groups
+# ----------------------------
+topic_groups <- list(
+  housing = c("gv_housing", "hh", "ho"),
+  health = c("gv_health", "mh", "ph", "hc"),
+  demographics = c("cv_r", "br", "sn", "co", "as", "ch"),
+  education = c("gv_isced", "te", "sp"),
+  psychology = c("gv_big5", "gv_children"),
+  networks = c("gv_networks"),
+  finance = c("ep", "cf", "ex", "ft"),
+  technical = c("technical_variables", "gv_weights", "gv_imputations", "interviewer_survey", "dropoff"),
+  macro = c("gv_exrates"),
+  country_specific = c("dn", "xt", "iv", "it", "ac")
+)
+
+# ----------------------------
+# 5. Load Demographic Data (Fact Table)
+# ----------------------------
+cv_file <- all_sav_files[str_detect(all_sav_files, "cv_r")]
+data_demo <- read_sav(cv_file)
+
+fact_vars <- c("mergeid", "br1", "country", "language", "gender", "yrbirth")
+fact_table <- data_demo %>%
+  select(any_of(fact_vars)) %>%
+  distinct()
+
+write_csv(fact_table, file.path(output_dir, "fact_table_demographics.csv"))
+
+# ----------------------------
+# 6. Metadata Initialization
+# ----------------------------
+meta_list <- list()
+
+# ----------------------------
+# 7. Fast Topic Processing (Chunked for large topics)
+# ----------------------------
+label_map <- list()
+meta_list <- list()
+
+for (topic in names(topic_groups)) {
+  message("\nProcessing topic: ", topic)
+  
+  file_suffixes <- topic_groups[[topic]]
+  topic_files <- map(file_suffixes, function(suffix) {
+    pattern <- paste0("sharew9_rel9-0-0_", suffix, "\\.sav$")
+    match <- all_sav_files[str_detect(all_sav_files, pattern)]
+    if (length(match) == 0) return(NULL)
+    return(match[1])
+  }) %>% compact()
+  
+  if (length(topic_files) == 0) next
+  
+  # Detect if topic is large
+  is_heavy_topic <- topic %in% c("technical")
+  
+  # Initialize combined table only for light topics
+  if (!is_heavy_topic) topic_df <- NULL
+  
+  for (file_path in topic_files) {
+    message("  Reading file: ", basename(file_path))
+    data_main <- read_sav(file_path)
+    source_file <- path_file(file_path)
+    
+    if (!"mergeid" %in% names(data_main)) next
+    if (all(is.na(data_main$mergeid))) next
+    
+    feature_names <- setdiff(names(data_main), "mergeid")
+    
+    # Build metadata and label map
+    for (feature in feature_names) {
+      col <- data_main[[feature]]
+      
+      # numeric values
+      col_num <- as.numeric(col)
+      var_label <- attr(col, "label")
+      
+      # store variable metadata
+      meta_list[[paste(topic, feature, sep = "_")]] <- tibble(
+        topic = topic,
+        feature = feature,
+        description = var_label,
+        source_file = source_file,
+        wave = wave
+      )
+      
+      # store label mapping if exists
+      if (is.labelled(col)) {
+        val_labs <- val_labels(col)
+        label_map[[paste(topic, feature, sep = "_")]] <- tibble(
+          feature = feature,
+          value = as.numeric(val_labs),
+          label = names(val_labs),
+          source_file = source_file,
+          topic = topic,
+          wave = wave
+        )
+      }
+    }
+    
+    # Clean missing codes
+    missing_codes <- c(-1:-9)
+    data_main <- data_main %>%
+      mutate(across(where(is.numeric), ~ ifelse(. %in% missing_codes, NA, .)))
+    
+    # Only keep mergeid + numeric features
+    data_num <- data_main %>%
+      mutate(across(-mergeid, as.numeric))
+    
+    # --- Light topics: merge into one ---
+    if (!is_heavy_topic) {
+      
+      # Check that data_num is a valid data.frame
+      if (is.data.frame(data_num) && ncol(data_num) > 1) {
+        
+        # First file initializes the topic table
+        if (is.null(topic_df)) {
+          topic_df <- data_num
+          
+        } else {
+          
+          # Safe join: try/catch prevents corruption
+          topic_df <- tryCatch(
+            full_join(topic_df, data_num, by = "mergeid"),
+            error = function(e) {
+              warning("⚠️ Failed to join file: ", basename(file_path),
+                      " — Skipping this file.")
+              return(topic_df)  # Keep previous good version
+            }
+          )
+        }
+        
+      } else {
+        warning("⚠️ Skipping invalid data_num in: ", basename(file_path))
+      }
+      
+      # --- Heavy topics: write each file separately ---
+    } else {
+      chunk_path <- file.path(features_dir, paste0("topic_", topic, "_", tools::file_path_sans_ext(source_file), ".csv"))
+      # Guard to ensure data_num is valid before writing
+      if (is.data.frame(data_num) && ncol(data_num) > 1 && nrow(data_num) > 0) {
+        write_csv(data_num, chunk_path)
+        message("    ✅ Saved chunk: ", basename(chunk_path))
+      } else {
+        warning("    ⚠️ Skipped invalid data in: ", basename(file_path), 
+                " (class: ", class(data_num), 
+                ", rows: ", ifelse(is.data.frame(data_num), nrow(data_num), NA), 
+                ", cols: ", ifelse(is.data.frame(data_num), ncol(data_num), NA), ")")
+        
+        # Optional: log skipped file
+        skipped_files[[basename(file_path)]] <- class(data_num)
+      }
+      
+    }
+    
+    rm(data_main, data_num); gc()
+  }
+  
+  # Save combined table for smaller topics
+  if (!is_heavy_topic && exists("topic_df")) {
+    topic_path <- file.path(features_dir, paste0("topic_", topic, ".csv"))
+    if (is.data.frame(topic_df)) {
+      
+      # Step 1: Remove unwanted columns (anything not mergeid or a metric)
+      cols_to_remove <- c("hhid", "language", "country", "coupleid", "hhid9", "mergeidp9", "coupleid9")
+      topic_df <- topic_df %>%
+        select(-matches("\\.x$|\\.y$|\\.x\\.x$|\\.y\\.y$|\\.x\\.y$")) %>%  # remove all .x, .y, .x.x columns
+        select(-any_of(cols_to_remove)) %>%                               # remove known extras
+        select(mergeid, everything())                                     # move mergeid to first column
+      
+      # Step 2: Remove duplicate mergeid-like columns (e.g. mergeidp9.x)
+      topic_df <- topic_df %>%
+        select(-matches("^mergeid.*(\\.x|\\.y|\\d+)$"))  # remove extra mergeid-like variants
+      
+      # Step 3: Write cleaned topic table
+      write_csv(topic_df, topic_path)
+    }
+    
+      else {
+      warning("❌ topic_df was not a valid data.frame. No file written for topic: ", topic)
+    }
+    
+    message("Saved topic: ", topic)
+  } else if (is_heavy_topic) {
+    message("Finished writing chunks for heavy topic: ", topic)
+  }
+  
+  rm(topic_df); gc()
+}
+
+
+# 8. Save Metadata & Label Map
+# ----------------------------
+write_csv(bind_rows(meta_list), file.path(output_dir, "feature_metadata.csv"))
+write_csv(bind_rows(label_map), file.path(output_dir, "feature_label_mapping.csv"))
+
+
+# ----------------------------
+# 9. Create Data Dictionary Table
+# ----------------------------
+
+# Convert metadata and labels to data frames (safe)
+meta_df <- bind_rows(meta_list[sapply(meta_list, is.data.frame)])
+label_df <- bind_rows(label_map[sapply(label_map, is.data.frame)])
+
+# Helper: infer data type from label map
+infer_type <- function(feature) {
+  if (feature %in% label_df$feature) return("Categorical")
+  return("Numeric")  # default assumption
+}
+
+# Collapse labels to create Allowed Values and Coding
+label_summary <- label_df %>%
+  group_by(feature) %>%
+  summarise(
+    allowed_values = paste(sort(unique(value)), collapse = ", "),
+    data_coding = paste0(value, "=", label, collapse = "; ")
+  )
+
+# Merge metadata and label summaries
+data_dict <- meta_df %>%
+  select(feature, description) %>%
+  distinct() %>%
+  mutate(data_type = sapply(feature, infer_type)) %>%
+  left_join(label_summary, by = "feature") %>%
+  rename(
+    `Column Name` = feature,
+    `Description` = description,
+    `Data Type` = data_type,
+    `Allowed Values` = allowed_values,
+    `Data Coding` = data_coding
+  )
+
+# Replace NA with blank for readability
+data_dict[is.na(data_dict)] <- ""
+
+# Save to output directory
+write_csv(data_dict, file.path(output_dir, "data_dictionary.csv"))
+message("✅ Data dictionary saved.")
