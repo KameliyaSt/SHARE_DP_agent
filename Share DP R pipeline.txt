@@ -26,7 +26,7 @@ all_sav_files <- dir_ls(data_dir, regexp = "\\.sav$")
 # ----------------------------
 topic_groups <- list(
   housing = c("gv_housing", "hh", "ho"),
-  health = c("gv_health", "mh", "ph", "hc"),
+  health = c("gv_health", "mh", "ph", "hc", "gs"),
   demographics = c("cv_r", "br", "sn", "co", "as", "ch"),
   education = c("gv_isced", "te", "sp"),
   psychology = c("gv_big5", "gv_children"),
